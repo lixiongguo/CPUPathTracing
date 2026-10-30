@@ -1,0 +1,15 @@
+# 构建产物
+build/
+Models/
+
+# 本地工具配置
+.claude/
+
+# 编译器 / IDE 中间文件
+*.o
+*.obj.tmp
+*.exe
+.vs/
+.idea/
+.cache/
+compile_commands.json
