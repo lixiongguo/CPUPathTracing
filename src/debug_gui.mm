@@ -12,7 +12,7 @@
 #include "util/rng.hpp"
 
 #import <Cocoa/Cocoa.h>
-#import "../../cpp/resource_hud.h"
+#import "resource_hud.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -1248,7 +1248,7 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
 }
 
 - (instancetype)initWithState:(std::shared_ptr<AppState>)appState {
-    self = [super initWithFrame:NSMakeRect(0, 0, 640, 560)];
+    self = [super initWithFrame:NSMakeRect(0, 0, 960, 800)];
     if (!self) return nil;
     state = std::move(appState);
 
@@ -1276,29 +1276,23 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     [modelRow addArrangedSubview:modelLabel];
     [modelRow addArrangedSubview:modelPopup];
 
-    NSTextField *renderLabel = [self makeCaption:@"渲染态"];
-    renderLabel.font = [NSFont systemFontOfSize:13];
     NSTextField *editLabel = [self makeCaption:@"编辑态"];
     editLabel.font = [NSFont systemFontOfSize:13];
     claySwitch = [[NSSwitch alloc] init];
     claySwitch.target = self;
     claySwitch.action = @selector(claySwitchChanged:);
     claySwitch.state = NSControlStateValueOff;
-    NSStackView *clayRow = [[NSStackView alloc] init];
-    clayRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    clayRow.spacing = 8;
-    clayRow.alignment = NSLayoutAttributeCenterY;
-    [clayRow addArrangedSubview:renderLabel];
-    [clayRow addArrangedSubview:claySwitch];
-    [clayRow addArrangedSubview:editLabel];
+    [modelRow addArrangedSubview:editLabel];
+    [modelRow addArrangedSubview:claySwitch];
 
     status = [[NSTextField alloc] init];
     status.editable = NO;
     status.bezeled = NO;
     status.drawsBackground = NO;
     status.textColor = [NSColor secondaryLabelColor];
-    status.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
-    status.maximumNumberOfLines = 2;
+    status.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    status.maximumNumberOfLines = 1;
+    status.lineBreakMode = NSLineBreakByTruncatingTail;
     status.stringValue = @"正在渲染第一帧…";
 
     NSStackView *root = [[NSStackView alloc] init];
@@ -1307,7 +1301,6 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     root.edgeInsets = NSEdgeInsetsMake(12, 12, 12, 12);
     root.translatesAutoresizingMaskIntoConstraints = NO;
     [root addArrangedSubview:modelRow];
-    [root addArrangedSubview:clayRow];
     [root addArrangedSubview:column];
     [root addArrangedSubview:status];
     [self addSubview:root];
@@ -1420,11 +1413,11 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     NSString *extra = note.empty() ? @"" : [NSString stringWithFormat:@"    %@", [NSString stringWithUTF8String:note.c_str()]];
     if (clay) {
         status.stringValue = [NSString stringWithFormat:
-            @"编辑态%@\n拖箭头平移，拖圆环旋转，拖端点方块缩放。空白处拖拽转相机   WASD 移动   滚轮变焦   松开后写入场景 JSON",
-            extra];
+            @"编辑态    %dx%d    拖箭头平移 · 拖圆环旋转 · 拖方块缩放 · 空白拖拽转相机%@",
+            w, h, extra];
     } else {
         status.stringValue = [NSString stringWithFormat:
-            @"spp %d    每轮 %d    %dx%d    %s%@\n拖拽旋转   WASD 移动   空格/Shift 升降   滚轮变焦   开关切到编辑态   V 法线   1/2/3 分辨率   -/= 每轮采样   R 重置   P 保存   Esc 退出",
+            @"spp %d    每轮 %d    %dx%d    %s · 拖拽旋转 · 滚轮变焦 · V 法线 · R 重置 · P 保存%@",
             spp, batch, w, h, viewName(mode, clay), extra];
     }
     self.window.title = clay ? @"焦散透镜  编辑态" : [NSString stringWithFormat:@"焦散透镜  spp %d", spp];
@@ -1792,7 +1785,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         std::cerr << "场景 " << scenePath << "\n网格 " << desc.meshPath << "  " << triangles.size() << " 面\n";
-        auto state = std::make_shared<AppState>(360, 270, desc, std::move(triangles));
+        auto state = std::make_shared<AppState>(480, 360, desc, std::move(triangles));
         state->catalog = std::move(desc.catalog);
         state->fallback = std::move(desc.fallback);
         state->sceneJson = scenePath;
@@ -1810,7 +1803,7 @@ int main(int argc, char **argv) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
         DebugView *view = [[DebugView alloc] initWithState:state];
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 720, 640)
+        NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 960, 800)
             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
             backing:NSBackingStoreBuffered
             defer:NO];

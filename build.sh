@@ -14,7 +14,11 @@ cd "$(dirname "$0")"
 
 CXX="${CXX:-clang++}"
 MODE="${1:-release}"
-REPO_DEPS="../cpp/deps"
+# 依赖与共用 HUD 现在跟着仓库走：glm 用 ddg-exercises 自带的副本，
+# resource_hud 与流体实验共用同一份。
+REPO_DEPS="../ddg-exercises/deps/polyscope/deps/glm"
+SHARED_DIR="../Fluid3d"
+hud_sources=("$SHARED_DIR/resource_hud.mm")
 
 release_flags=(-std=c++17 -O3 -arch arm64 -mcpu=native)
 debug_flags=(-std=c++17 -O0 -g -arch arm64)
@@ -24,7 +28,7 @@ if [[ "$host" != "arm64" ]]; then
   debug_flags=(-std=c++17 -O0 -g)
 fi
 
-includes=(-I include -I "$REPO_DEPS")
+includes=(-I include -I "$REPO_DEPS" -I "$SHARED_DIR")
 common_sources=(
   src/image_stub.cpp
   src/renderer/path_tracing_renderer.cpp
@@ -69,7 +73,7 @@ build() {
 
 build_gui() {
   compile_bin "$1" debug_gui -fobjc-arc -framework Cocoa \
-    src/debug_gui.mm ../cpp/resource_hud.mm src/renderer/normal_renderer.cpp \
+    src/debug_gui.mm "${hud_sources[@]}" src/renderer/normal_renderer.cpp \
     src/shape/triangle.cpp src/accelerate/bvh.cpp \
     src/material/dielectric_material.cpp src/material/microfacet_theory.cpp \
     src/light/uniform_infinite_light.cpp \

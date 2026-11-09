@@ -13,3 +13,4 @@ Models/
 .idea/
 .cache/
 compile_commands.json
+renderer/Scenes/
