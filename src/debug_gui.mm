@@ -616,6 +616,12 @@ struct AppState {
         scene.build();
         caustic.clear();
         causticReady = false;
+        orthoReady = false;
+        {
+            std::lock_guard<std::mutex> lock(imageMutex);
+            orthoRgba.clear();
+            orthoSide = 0;
+        }
         clearFilm();
     }
 
@@ -646,6 +652,98 @@ struct AppState {
             return;
         }
         applyMesh(entry, std::move(triangles));
+    }
+
+    std::filesystem::path causticDesignBinary() const {
+        const std::filesystem::path candidates[] = {
+            std::filesystem::current_path() / "../../Caustics/fast_caustic_design-master/build-local/caustic_design",
+            std::filesystem::path("/Users/lgxgeogo/Desktop/MyDoc/Caustics/fast_caustic_design-master/build-local/caustic_design"),
+        };
+        for (const auto &path : candidates) {
+            if (std::filesystem::is_regular_file(path)) return path;
+        }
+        return {};
+    }
+
+    void loadTargetImages() {
+        const std::filesystem::path candidates[] = {
+            std::filesystem::current_path() / "../OptimalTransport/data/caustic_lens_data",
+            std::filesystem::path("/Users/lgxgeogo/Desktop/MyDoc/GeometryLab/OptimalTransport/data/caustic_lens_data"),
+        };
+        std::filesystem::path directory;
+        for (const auto &path : candidates) {
+            if (std::filesystem::is_directory(path)) {
+                directory = path;
+                break;
+            }
+        }
+        targetImages.clear();
+        if (directory.empty()) return;
+        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+            if (!entry.is_regular_file()) continue;
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") {
+                targetImages.push_back(entry.path());
+            }
+        }
+        std::sort(targetImages.begin(), targetImages.end(), [](const auto &a, const auto &b) {
+            return a.filename().string() < b.filename().string();
+        });
+    }
+
+    std::string designLens(const std::string &imagePath, std::string &error) {
+        const std::filesystem::path binary = causticDesignBinary();
+        if (binary.empty()) {
+            error = "找不到 caustic_design";
+            return {};
+        }
+        const std::filesystem::path directory = modelsDir.empty() ? std::filesystem::path("Models") : modelsDir;
+        std::error_code mkdirError;
+        std::filesystem::create_directories(directory, mkdirError);
+        const std::string stem = std::filesystem::path(imagePath).stem().string();
+        const std::filesystem::path obj = directory / (stem + ".obj");
+        NSTask *task = [[NSTask alloc] init];
+        task.executableURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:binary.c_str()]];
+        task.arguments = @[
+            @"-in_trg", [NSString stringWithUTF8String:imagePath.c_str()],
+            @"-res", @"160",
+            @"-focal_l", @"3",
+            @"-thickness", @"0.2",
+            @"-mesh_width", @"1",
+            @"-output", [NSString stringWithUTF8String:obj.string().c_str()],
+            @"-v", @"0",
+            @"-itr", @"80",
+        ];
+        NSError *launchError = nil;
+        if (![task launchAndReturnError:&launchError]) {
+            error = launchError.localizedDescription.UTF8String ?: "无法启动透镜计算";
+            return {};
+        }
+        [task waitUntilExit];
+        if (task.terminationStatus != 0 || !std::filesystem::is_regular_file(obj)) {
+            error = "透镜计算失败";
+            return {};
+        }
+        MeshEntry entry = catalog.empty() ? fallback : catalog.front();
+        entry.name = obj.filename().string();
+        entry.path = obj;
+        entry.note = "由这张图算出的透镜";
+        bool replaced = false;
+        for (auto &slot : catalog) {
+            if (slot.name == entry.name) {
+                slot = entry;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) catalog.push_back(entry);
+        if (std::find(modelNames.begin(), modelNames.end(), entry.name) == modelNames.end()) {
+            modelNames.push_back(entry.name);
+        }
+        return entry.name;
     }
 
     void captureGizmo(GizmoFrame &frame) const {
@@ -930,8 +1028,8 @@ struct AppState {
         return glm::vec3(caustic[static_cast<size_t>(y * causticBins + x)]);
     }
 
-    glm::vec3 shadeCaustic(const glm::ivec2 &pixel) const {
-        auto hit = scene.intersect(camera.generateRay(pixel));
+    glm::vec3 shadeView(const Ray &ray) const {
+        auto hit = scene.intersect(ray);
         if (!hit.has_value()) return { 0.03f, 0.032f, 0.036f };
         if (hit->material == &wallMat) {
             const glm::vec3 pattern = causticAt(hit->hit_point);
@@ -941,6 +1039,37 @@ struct AppState {
         const glm::vec3 normal = glm::normalize(hit->normal);
         const float shade = 0.22f + 0.78f * std::abs(glm::dot(normal, glm::vec3(0.f, 0.f, 1.f)));
         return { shade, shade, shade };
+    }
+
+    glm::vec3 shadeCaustic(const glm::ivec2 &pixel) const {
+        return shadeView(camera.generateRay(pixel));
+    }
+
+    // Parallel rays onto the receiver. This is the caustic as an orthographic
+    // picture of the wall, not a perspective snapshot of the scene.
+    void renderOrthoPattern() {
+        if (!causticReady) return;
+        constexpr int n = 384;
+        std::vector<glm::vec3> samples(static_cast<size_t>(n) * n);
+        thread_pool.parallelFor(n, n, [&](size_t x, size_t y) {
+            const float u = (static_cast<float>(x) + 0.5f) / n * 2.f - 1.f;
+            const float v = 1.f - (static_cast<float>(y) + 0.5f) / n * 2.f;
+            const glm::vec3 point = wall.point + (u * mapHalf) * wall.x_axis + (v * mapHalf) * wall.z_axis;
+            const Ray ray { point + wall.normal * 1.5f, -wall.normal };
+            samples[y * n + x] = shadeView(ray);
+        }, false);
+        thread_pool.wait();
+        std::vector<uint8_t> pixels(static_cast<size_t>(n) * n * 4);
+        for (int i = 0; i < n * n; ++i) {
+            const glm::vec3 color = tonemap(samples[static_cast<size_t>(i)], true);
+            pixels[static_cast<size_t>(i) * 4 + 0] = static_cast<uint8_t>(glm::clamp(color.r, 0.f, 1.f) * 255);
+            pixels[static_cast<size_t>(i) * 4 + 1] = static_cast<uint8_t>(glm::clamp(color.g, 0.f, 1.f) * 255);
+            pixels[static_cast<size_t>(i) * 4 + 2] = static_cast<uint8_t>(glm::clamp(color.b, 0.f, 1.f) * 255);
+            pixels[static_cast<size_t>(i) * 4 + 3] = 255;
+        }
+        std::lock_guard<std::mutex> lock(imageMutex);
+        orthoRgba.swap(pixels);
+        orthoSide = n;
     }
 
     bool buildCaustic() {
@@ -1080,6 +1209,10 @@ struct AppState {
             awake.store(true);
             return;
         }
+        if (!clay && mode != ViewMode::Normal && causticReady && !orthoReady) {
+            renderOrthoPattern();
+            orthoReady = true;
+        }
 
         const size_t w = film.getWidth();
         const size_t h = film.getHeight();
@@ -1135,6 +1268,7 @@ struct AppState {
     std::filesystem::path sceneJson;
     std::string fileNote;
     std::vector<std::string> modelNames;
+    std::vector<std::filesystem::path> targetImages;
     std::vector<MeshEntry> catalog;
     MeshEntry fallback;
     std::string currentModel;
@@ -1199,8 +1333,11 @@ struct AppState {
     int spp = 0;
     std::chrono::steady_clock::time_point lastTick = std::chrono::steady_clock::now();
 
+    bool orthoReady = false;
     std::mutex imageMutex;
     std::vector<uint8_t> rgba;
+    std::vector<uint8_t> orthoRgba;
+    int orthoSide = 0;
     GizmoFrame gizmoFrame;
     int shownW = 0, shownH = 0, shownSpp = 0, shownBatch = 1;
     ViewMode shownView = ViewMode::Render;
@@ -1239,22 +1376,36 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
 @implementation DebugView {
     std::shared_ptr<AppState> state;
     NSImageView *imageView;
+    NSImageView *patternView;
     NSTextField *caption;
     NSTextField *status;
     NSSwitch *claySwitch;
     NSPopUpButton *modelPopup;
+    NSPopUpButton *imagePopup;
     BOOL scheduled;
     BOOL gizmoMiss;
 }
 
 - (instancetype)initWithState:(std::shared_ptr<AppState>)appState {
-    self = [super initWithFrame:NSMakeRect(0, 0, 960, 800)];
+    self = [super initWithFrame:NSMakeRect(0, 0, 1180, 760)];
     if (!self) return nil;
     state = std::move(appState);
 
-    caption = [self makeCaption:@"渲染态"];
+    caption = [self makeCaption:@"场景"];
     imageView = [self makeImageView];
-    NSStackView *column = [self column:caption image:imageView];
+    NSStackView *sceneColumn = [self column:caption image:imageView];
+    NSTextField *patternTitle = [self makeCaption:@"仿真图案"];
+    patternView = [self makeImageView];
+    NSStackView *patternColumn = [self column:patternTitle image:patternView];
+    NSStackView *pictures = [[NSStackView alloc] init];
+    pictures.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    pictures.spacing = 12;
+    pictures.distribution = NSStackViewDistributionFillEqually;
+    pictures.alignment = NSLayoutAttributeTop;
+    [pictures addArrangedSubview:sceneColumn];
+    [pictures addArrangedSubview:patternColumn];
+    [sceneColumn setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [patternColumn setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     NSTextField *modelLabel = [self makeCaption:@"模型"];
     modelLabel.font = [NSFont systemFontOfSize:13];
@@ -1284,6 +1435,24 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     claySwitch.state = NSControlStateValueOff;
     [modelRow addArrangedSubview:editLabel];
     [modelRow addArrangedSubview:claySwitch];
+    NSTextField *imageLabel = [self makeCaption:@"图片"];
+    imageLabel.font = [NSFont systemFontOfSize:13];
+    imagePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    for (const auto &path : state->targetImages) {
+        [imagePopup addItemWithTitle:[NSString stringWithUTF8String:path.filename().string().c_str()]];
+    }
+    if (imagePopup.numberOfItems == 0) {
+        [imagePopup addItemWithTitle:@"（目录里没有图片）"];
+        imagePopup.enabled = NO;
+    } else {
+        NSString *current = @"A1_grey2.png";
+        if ([imagePopup itemWithTitle:current]) [imagePopup selectItemWithTitle:current];
+    }
+    imagePopup.target = self;
+    imagePopup.action = @selector(imageChanged:);
+    [imagePopup.widthAnchor constraintEqualToConstant:180].active = YES;
+    [modelRow addArrangedSubview:imageLabel];
+    [modelRow addArrangedSubview:imagePopup];
 
     status = [[NSTextField alloc] init];
     status.editable = NO;
@@ -1301,7 +1470,7 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     root.edgeInsets = NSEdgeInsetsMake(12, 12, 12, 12);
     root.translatesAutoresizingMaskIntoConstraints = NO;
     [root addArrangedSubview:modelRow];
-    [root addArrangedSubview:column];
+    [root addArrangedSubview:pictures];
     [root addArrangedSubview:status];
     [self addSubview:root];
     [ResourceHud attachToView:self];
@@ -1312,7 +1481,8 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
         [root.topAnchor constraintEqualToAnchor:self.topAnchor],
         [root.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
         [imageView.heightAnchor constraintEqualToAnchor:imageView.widthAnchor multiplier:0.75],
-        [imageView.widthAnchor constraintGreaterThanOrEqualToConstant:480],
+        [patternView.heightAnchor constraintEqualToAnchor:imageView.heightAnchor],
+        [imageView.widthAnchor constraintGreaterThanOrEqualToConstant:360],
     ]];
     return self;
 }
@@ -1353,7 +1523,7 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
 - (NSView *)hitTest:(NSPoint)point {
     NSView *hit = [super hitTest:point];
     for (NSView *walk = hit; walk && walk != self; walk = walk.superview) {
-        if (walk == claySwitch || walk == modelPopup) return hit;
+        if (walk == claySwitch || walk == modelPopup || walk == imagePopup) return hit;
     }
     return NSPointInRect(point, self.bounds) ? self : nil;
 }
@@ -1408,7 +1578,15 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     if (state->gizmoDragging) activeAxis = state->gizmoAxis;
     if (clay) drawGizmo(pixels, w, h, gizmo, activeAxis);
     imageView.image = imageFromRGBA(pixels, w, h);
-    caption.stringValue = clay ? @"编辑态" : (mode == ViewMode::Normal ? @"法线" : @"渲染态");
+    std::vector<uint8_t> pattern;
+    int patternSide = 0;
+    {
+        std::lock_guard<std::mutex> lock(state->imageMutex);
+        pattern = state->orthoRgba;
+        patternSide = state->orthoSide;
+    }
+    patternView.image = imageFromRGBA(pattern, patternSide, patternSide);
+    caption.stringValue = clay ? @"编辑态" : (mode == ViewMode::Normal ? @"法线" : @"场景");
 
     NSString *extra = note.empty() ? @"" : [NSString stringWithFormat:@"    %@", [NSString stringWithUTF8String:note.c_str()]];
     if (clay) {
@@ -1427,6 +1605,44 @@ NSImage *imageFromRGBA(const std::vector<uint8_t> &rgba, int w, int h) {
     state->inputEpoch.fetch_add(1);
     state->awake.store(true);
     [self scheduleBatch];
+}
+
+- (void)imageChanged:(NSPopUpButton *)sender {
+    const NSInteger index = sender.indexOfSelectedItem;
+    if (index < 0 || static_cast<size_t>(index) >= state->targetImages.size()) return;
+    const std::string imagePath = state->targetImages[static_cast<size_t>(index)].string();
+    imagePopup.enabled = NO;
+    modelPopup.enabled = NO;
+    status.stringValue = @"正在用这张图计算透镜…";
+    std::shared_ptr<AppState> kept = state;
+    __weak DebugView *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        std::string error;
+        const std::string objName = kept->designLens(imagePath, error);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DebugView *view = weakSelf;
+            if (!view) return;
+            view->imagePopup.enabled = YES;
+            view->modelPopup.enabled = YES;
+            if (objName.empty()) {
+                view->status.stringValue = [NSString stringWithUTF8String:error.c_str()];
+                return;
+            }
+            NSString *title = [NSString stringWithUTF8String:objName.c_str()];
+            if ([view->modelPopup itemWithTitle:title] == nil) {
+                [view->modelPopup addItemWithTitle:title];
+            }
+            [view->modelPopup selectItemWithTitle:title];
+            {
+                std::lock_guard<std::mutex> lock(kept->inputMutex);
+                kept->pendingModel = objName;
+                kept->note = "正在读取 " + objName;
+            }
+            kept->meshDirty.store(true);
+            kept->clayEpoch.fetch_add(1);
+            [view wake];
+        });
+    });
 }
 
 - (void)modelChanged:(NSPopUpButton *)sender {
@@ -1792,6 +2008,7 @@ int main(int argc, char **argv) {
         state->fileNote = desc.note;
         state->modelsDir = findModelsDir(scenePath);
         state->modelNames = listObjModels(state->modelsDir);
+        state->loadTargetImages();
         if (dump) {
             state->sppBatch = 1;
             state->renderBatch();
@@ -1803,7 +2020,7 @@ int main(int argc, char **argv) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
         DebugView *view = [[DebugView alloc] initWithState:state];
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 960, 800)
+        NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1180, 760)
             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
             backing:NSBackingStoreBuffered
             defer:NO];
